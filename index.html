@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rose Garden — Interactive Hand Roses</title>
+    <meta name="description" content="Real-time hand-tracking red rose experience">
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300&display=swap" rel="stylesheet">
+
+    <!-- MediaPipe Hands -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+    <div id="loading">
+        <div class="loader-ring"><div></div><div></div><div></div></div>
+        <p class="loader-text">Preparing your roses…</p>
+        <p class="loader-sub">Please allow camera access</p>
+    </div>
+    <canvas id="canvas"></canvas>
+    <video id="video" playsinline autoplay muted style="display:none"></video>
+    <script src="app.js"></script>
+</body>
+</html>

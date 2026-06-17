@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
 """
-🌸 Generative Flower Garden — Real-time Hand-Tracked Flower Effects
-════════════════════════════════════════════════════════════════════
-A real-time webcam application using OpenCV and MediaPipe that detects
-hand landmarks and renders stunning generative flower effects growing
-from each fingertip. Each finger sprouts a unique flower species with
-layered petals, luminous particles, and ethereal glow effects.
+🌺 Generative Flower Garden — TouchDesigner-style Interactive Flower Effect
+════════════════════════════════════════════════════════════════════════════
+Real-time webcam app: glowing animated flowers and curved stems shoot
+outward from each fingertip in a fan/spray pattern.
 
-Requirements:
-    pip install opencv-python mediapipe numpy
-
-Controls:
-    q — Quit the application
-
-Author: Generative Art System
+Requirements: pip install opencv-python mediapipe numpy
+Run:          python flower_garden.py
+Quit:         press 'q'
 """
 
 import cv2
@@ -23,619 +17,479 @@ import math
 import time
 import os
 import random as rng
-from collections import deque
+import threading
+import queue
 
-# MediaPipe Tasks API (0.10.x+)
-BaseOptions = mp.tasks.BaseOptions
-HandLandmarker = mp.tasks.vision.HandLandmarker
-HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
-VisionRunningMode = mp.tasks.vision.RunningMode
+# ─── MediaPipe Tasks API (v0.10+) ─────────────────────────────────────────
+BaseOptions       = mp.tasks.BaseOptions
+HandLandmarker    = mp.tasks.vision.HandLandmarker
+HandLandmarkerOpts = mp.tasks.vision.HandLandmarkerOptions
+RunMode           = mp.tasks.vision.RunningMode
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════
 
-CAM_WIDTH, CAM_HEIGHT = 1280, 720     # Requested camera resolution
-MAX_HANDS = 2                          # Maximum hands to track
-TRAIL_LENGTH = 15                      # Frames to remember for motion trail
-STEM_MAX_LEN = 60                      # Maximum stem length in pixels
-PETAL_LAYERS = 4                       # Concentric petal rings per flower
-PETALS_PER_LAYER_BASE = 6             # Petals in the innermost ring
-PARTICLE_SPAWN_RATE = 2                # Particles spawned per flower per frame
-MAX_PARTICLES = 400                    # Global particle cap
-PARTICLE_LIFE_BASE = 45               # Base particle lifetime in frames
-SMOOTH_FACTOR = 0.35                   # EMA smoothing (lower = smoother)
-BG_DARKEN = 0.50                       # Background darkening multiplier
-BLOOM_SIGMA = 7                        # Gaussian sigma for glow bloom pass
-GROWTH_SPEED = 0.07                    # How fast flowers bloom open (per frame)
-FADE_SPEED = 0.04                      # How fast flowers fade when hand leaves
+CAM_W, CAM_H       = 1280, 720
+MAX_HANDS           = 2
+SMOOTH_ALPHA        = 0.45          # EMA smoothing for landmark jitter
+GROW_FRAMES         = 22            # Frames for stem growth
+HOLD_FRAMES         = 6             # Frames to hold full bloom
+CYCLE               = GROW_FRAMES + HOLD_FRAMES
+STEMS_MIN, STEMS_MAX = 3, 5        # Stems per finger per cycle
+STEM_MAX_LEN        = 130           # Max stem length px
+FAN_SPREAD          = math.pi * 0.50  # ~90° fan
+PETAL_N             = 5             # Petals per flower head
+PETAL_LEN           = 18            # Petal length
+PETAL_W             = 6             # Petal width at shoulder
+BG_ALPHA            = 0.50          # Background dim
+PALM_LINES          = 5             # Crossing lines on palm
+PALM_RESHUFFLE      = 50            # Re-randomise palm pairs every N frames
+CONF_THRESH         = 0.65          # Min hand confidence to render
 
-# MediaPipe fingertip landmark indices (thumb → pinky)
-FINGERTIP_IDS = [4, 8, 12, 16, 20]
-
-# Palm landmarks used for connection lines
-PALM_LANDMARKS = [0, 1, 5, 9, 13, 17]
-PALM_CONNECTIONS = [(0, 1), (1, 5), (5, 9), (9, 13), (13, 17), (0, 17)]
+FINGERTIP  = [4, 8, 12, 16, 20]
+KNUCKLE    = [5, 6, 9, 10, 13, 14, 17, 18]   # MCP + PIP
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  FLOWER COLOR PALETTES — One unique species per finger (BGR format)
+#  COLOUR PALETTES  (BGR)
 # ═══════════════════════════════════════════════════════════════════════════
+#  Matching the TouchDesigner reference: warm stems/petals, cool palm lines.
 
-FINGER_SPECIES = [
-    {   # Thumb — Crimson Rose
-        "name": "Crimson Rose",
-        "petals": [
-            (50, 30, 210),   # Deep crimson (inner)
-            (40, 50, 240),   # Bright red
-            (60, 80, 200),   # Rose
-            (80, 100, 180),  # Soft pink (outer)
-        ],
-        "stem":     (50, 130, 55),
-        "glow":     (40, 25, 190),
-        "particle": (70, 90, 255),
-        "center":   (50, 190, 255),
+COLORS = [
+    {   # Thumb — deep orange / flame
+        "stem": (0, 90, 235),  "pet1": (0, 55, 255),
+        "pet2": (0, 120, 240), "glow": (0, 70, 200),
+        "core": (190, 215, 255),
     },
-    {   # Index — Golden Dahlia
-        "name": "Golden Dahlia",
-        "petals": [
-            (15, 170, 250),  # Rich gold (inner)
-            (25, 195, 240),  # Amber
-            (10, 155, 220),  # Honey
-            (35, 210, 255),  # Bright yellow (outer)
-        ],
-        "stem":     (45, 155, 50),
-        "glow":     (15, 150, 230),
-        "particle": (30, 210, 255),
-        "center":   (70, 235, 255),
+    {   # Index — golden yellow / amber
+        "stem": (0, 195, 255), "pet1": (0, 170, 250),
+        "pet2": (10, 215, 255),"glow": (0, 175, 230),
+        "core": (175, 240, 255),
     },
-    {   # Middle — Violet Orchid
-        "name": "Violet Orchid",
-        "petals": [
-            (210, 45, 175),  # Deep violet (inner)
-            (240, 65, 195),  # Purple
-            (195, 35, 155),  # Mauve
-            (230, 75, 215),  # Lavender (outer)
-        ],
-        "stem":     (55, 125, 50),
-        "glow":     (190, 35, 170),
-        "particle": (245, 110, 225),
-        "center":   (250, 145, 255),
+    {   # Middle — hot magenta / violet
+        "stem": (190, 0, 200), "pet1": (255, 20, 200),
+        "pet2": (200, 40, 180),"glow": (170, 0, 160),
+        "core": (255, 190, 245),
     },
-    {   # Ring — Teal Lotus
-        "name": "Teal Lotus",
-        "petals": [
-            (175, 175, 25),  # Deep teal (inner)
-            (195, 195, 40),  # Teal
-            (155, 165, 15),  # Sea green
-            (215, 210, 55),  # Cyan (outer)
-        ],
-        "stem":     (95, 145, 40),
-        "glow":     (165, 165, 25),
-        "particle": (210, 235, 75),
-        "center":   (195, 250, 115),
+    {   # Ring — teal / cyan
+        "stem": (180, 180, 0), "pet1": (230, 230, 0),
+        "pet2": (195, 205, 0), "glow": (155, 155, 0),
+        "core": (225, 255, 200),
     },
-    {   # Pinky — Magenta Blossom
-        "name": "Magenta Blossom",
-        "petals": [
-            (195, 35, 215),  # Deep magenta (inner)
-            (175, 55, 245),  # Hot pink
-            (215, 25, 195),  # Fuchsia
-            (155, 45, 235),  # Neon pink (outer)
-        ],
-        "stem":     (75, 115, 55),
-        "glow":     (175, 25, 205),
-        "particle": (195, 95, 250),
-        "center":   (215, 155, 255),
+    {   # Pinky — coral / pink
+        "stem": (95, 125, 240),"pet1": (140, 145, 255),
+        "pet2": (115, 135, 248),"glow":(80, 105, 215),
+        "core": (205, 195, 255),
     },
 ]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  UTILITY FUNCTIONS
+#  THREADED CAMERA
 # ═══════════════════════════════════════════════════════════════════════════
 
-def ease_out_cubic(t):
-    """Cubic ease-out: fast start, smooth deceleration."""
-    return 1.0 - (1.0 - t) ** 3
+class CamThread:
+    """Background thread grabs frames so the render loop never waits on I/O."""
 
-
-def clamp_color(c):
-    """Clamp a BGR color tuple to valid [0, 255] range."""
-    return tuple(max(0, min(255, int(v))) for v in c)
-
-
-def scale_color(color, factor):
-    """Multiply a BGR color by a scalar factor, clamped to [0,255]."""
-    return clamp_color(tuple(c * factor for c in color))
-
-
-def bezier_quadratic(p0, p1, p2, n_points=12):
-    """
-    Generate points along a quadratic Bézier curve.
-    Used to draw organic, curved flower stems.
-    """
-    points = []
-    for i in range(n_points + 1):
-        t = i / n_points
-        inv = 1 - t
-        x = inv * inv * p0[0] + 2 * inv * t * p1[0] + t * t * p2[0]
-        y = inv * inv * p0[1] + 2 * inv * t * p1[1] + t * t * p2[1]
-        points.append([int(x), int(y)])
-    return np.array(points, dtype=np.int32)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  PARTICLE SYSTEM — Luminous pollen / ember trails
-# ═══════════════════════════════════════════════════════════════════════════
-
-class Particle:
-    """A single luminous particle that drifts upward like floating pollen."""
-    __slots__ = ['x', 'y', 'vx', 'vy', 'life', 'max_life', 'color', 'size']
-
-    def __init__(self, x, y, color):
-        self.x = x + rng.uniform(-10, 10)
-        self.y = y + rng.uniform(-10, 10)
-        self.vx = rng.uniform(-0.7, 0.7)       # Slight horizontal drift
-        self.vy = rng.uniform(-2.2, -0.6)       # Upward drift
-        self.max_life = PARTICLE_LIFE_BASE + rng.randint(-12, 12)
-        self.life = self.max_life
-        self.color = color
-        self.size = rng.uniform(1.5, 3.8)
-
-    def update(self, t):
-        """Advance particle physics with gentle sine-wave sway."""
-        sway = math.sin(t * 3.5 + self.x * 0.015) * 0.35
-        self.x += self.vx + sway
-        self.y += self.vy
-        self.vy *= 0.985               # Slow deceleration
-        self.life -= 1
-        self.size *= 0.988
+    def __init__(self, src=0):
+        self.cap = cv2.VideoCapture(src)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_W)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
+        self.cap.set(cv2.CAP_PROP_FPS, 60)
+        self.q = queue.Queue(maxsize=2)
+        self.stopped = False
 
     @property
-    def alive(self):
-        return self.life > 0 and self.size > 0.4
+    def opened(self):
+        return self.cap.isOpened()
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+        return self
+
+    def _loop(self):
+        while not self.stopped:
+            ok, f = self.cap.read()
+            if not ok:
+                self.stopped = True; break
+            if self.q.full():
+                try: self.q.get_nowait()
+                except queue.Empty: pass
+            self.q.put(f)
+
+    def read(self):
+        try: return self.q.get(timeout=1)
+        except queue.Empty: return None
+
+    def release(self):
+        self.stopped = True; self.cap.release()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  LANDMARK SMOOTHER  (EMA)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Smoother:
+    def __init__(self, a=SMOOTH_ALPHA):
+        self.a = a; self.p = None
+
+    def __call__(self, lm, w, h):
+        raw = np.array([[l.x * w, l.y * h] for l in lm], dtype=np.float64)
+        if self.p is None: self.p = raw.copy()
+        else:              self.p += (raw - self.p) * self.a
+        return self.p.copy()
+
+    def reset(self): self.p = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  FINGER BLOOM  (growth cycle state machine)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Bloom:
+    """Per-finger animation: grow → hold → randomise → repeat."""
+
+    def __init__(self):
+        self.t = 0
+        self.ns = 0
+        self.ang = []          # angle offsets per stem
+        self.mlen = []         # max-length per stem
+        self.curv = []         # curvature per stem
+        self._rand()
+
+    def _rand(self):
+        self.ns = rng.randint(STEMS_MIN, STEMS_MAX)
+        half = FAN_SPREAD / 2
+        base = np.linspace(-half, half, self.ns)
+        self.ang  = [float(a + rng.uniform(-0.10, 0.10)) for a in base]
+        self.mlen = [STEM_MAX_LEN * rng.uniform(0.72, 1.0) for _ in range(self.ns)]
+        self.curv = [rng.choice([-1, 1]) * rng.uniform(0.12, 0.32) for _ in range(self.ns)]
+
+    def tick(self):
+        self.t += 1
+        if self.t >= CYCLE:
+            self.t = 0; self._rand()
 
     @property
-    def alpha(self):
-        """Opacity: fades out over lifetime."""
-        return max(0.0, self.life / self.max_life)
+    def g(self):
+        """Growth 0→1 with cubic ease-out."""
+        if self.t < GROW_FRAMES:
+            r = self.t / GROW_FRAMES
+            return 1.0 - (1.0 - r) ** 3
+        return 1.0
 
-
-class ParticleSystem:
-    """Manages the global pool of luminous particles."""
-
-    def __init__(self):
-        self.particles: list[Particle] = []
-
-    def spawn(self, x, y, color, count=1):
-        """Emit new particles at a position."""
-        for _ in range(count):
-            if len(self.particles) < MAX_PARTICLES:
-                self.particles.append(Particle(x, y, color))
-
-    def update(self, t):
-        """Advance all particles, cull dead ones."""
-        for p in self.particles:
-            p.update(t)
-        self.particles = [p for p in self.particles if p.alive]
-
-    def draw(self, overlay):
-        """Render all particles onto the effect overlay."""
-        for p in self.particles:
-            a = p.alpha
-            r = max(1, int(p.size))
-            ix, iy = int(p.x), int(p.y)
-            # Core dot
-            cv2.circle(overlay, (ix, iy), r, scale_color(p.color, a),
-                        -1, cv2.LINE_AA)
-            # Soft outer halo
-            if r >= 1:
-                cv2.circle(overlay, (ix, iy), r * 3,
-                           scale_color(p.color, a * 0.25), -1, cv2.LINE_AA)
+    def reset(self):
+        self.t = 0; self._rand()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  FINGERTIP TRAIL — Smooth tracking with motion memory
+#  FAST DRAWING HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
 
-class FingertipTrail:
-    """
-    Tracks a single fingertip with EMA smoothing and maintains
-    a motion trail of the last TRAIL_LENGTH positions.
-    """
-
-    def __init__(self):
-        self.positions: deque[tuple[int, int]] = deque(maxlen=TRAIL_LENGTH)
-        self.smoothed = None          # Current EMA-smoothed position
-        self.active = False           # Whether the finger is currently detected
-        self.growth = 0.0             # 0→1 bloom animation progress
-        self.palm_dir = (0.0, -1.0)   # Direction away from palm (for stems)
-
-    def update(self, x, y, palm_cx, palm_cy):
-        """Feed a new raw landmark position; smooths & stores in trail."""
-        if self.smoothed is None:
-            self.smoothed = np.array([x, y], dtype=np.float64)
-        else:
-            self.smoothed += (np.array([x, y]) - self.smoothed) * SMOOTH_FACTOR
-
-        sx, sy = int(self.smoothed[0]), int(self.smoothed[1])
-        self.positions.appendleft((sx, sy))
-        self.active = True
-        self.growth = min(1.0, self.growth + GROWTH_SPEED)
-
-        # Compute direction away from palm center (for stem growth direction)
-        dx, dy = sx - palm_cx, sy - palm_cy
-        dist = max(1.0, math.hypot(dx, dy))
-        self.palm_dir = (dx / dist, dy / dist)
-
-    def fade(self):
-        """Gracefully fade when the finger is no longer detected."""
-        self.active = False
-        self.growth = max(0.0, self.growth - FADE_SPEED)
-        if self.growth <= 0.01:
-            self.positions.clear()
-            self.smoothed = None
+def _sc(c, f):
+    """Scale BGR colour by factor, clamped."""
+    return (max(0, min(255, int(c[0]*f))),
+            max(0, min(255, int(c[1]*f))),
+            max(0, min(255, int(c[2]*f))))
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  RENDERING — Stems, petals, halos, connections
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Bezier curve sampler ──────────────────────────────────────────────────
 
-def draw_stem(overlay, base, tip, color, thickness=2, alpha=1.0):
-    """
-    Draw an organic curved stem from base to tip using a Bézier curve.
-    A slight sine-based offset at the midpoint creates natural curvature.
-    """
-    col = scale_color(color, alpha)
-    # Midpoint with organic curvature offset
-    mx = (base[0] + tip[0]) // 2 + int(math.sin(base[1] * 0.025) * 10)
-    my = (base[1] + tip[1]) // 2 + int(math.cos(base[0] * 0.025) * 6)
-    curve_pts = bezier_quadratic(base, (mx, my), tip, n_points=14)
-    cv2.polylines(overlay, [curve_pts], False, col,
-                  max(1, thickness), cv2.LINE_AA)
+def _bezier(sx, sy, cx, cy, ex, ey, n=14):
+    """Return (n+1, 1, 2) int32 array for cv2.polylines."""
+    ts = np.linspace(0.0, 1.0, n + 1, dtype=np.float64)
+    inv = 1.0 - ts
+    xs = (inv*inv*sx + 2*inv*ts*cx + ts*ts*ex).astype(np.int32)
+    ys = (inv*inv*sy + 2*inv*ts*cy + ts*ts*ey).astype(np.int32)
+    return np.stack([xs, ys], axis=-1).reshape(-1, 1, 2)
 
 
-def draw_petal(overlay, cx, cy, angle, length, width, color):
-    """
-    Draw a single elongated elliptical petal radiating from (cx, cy)
-    at the given angle. Uses cv2.ellipse for smooth anti-aliased rendering.
-    """
-    half_len = int(length / 2)
-    half_wid = int(width / 2)
-    if half_len < 1 or half_wid < 1:
+# ── Glow stem (3-pass blur stack — NO heavy GaussianBlur) ─────────────────
+
+def draw_stem(img, sx, sy, ex, ey, curv, color):
+    """Curved stem with 3-pass glow: thick-faint → medium → thin-bright."""
+    mx, my = (sx + ex) / 2, (sy + ey) / 2
+    d = max(1.0, math.hypot(ex - sx, ey - sy))
+    px, py = -(ey - sy) / d, (ex - sx) / d   # perpendicular
+    off = d * curv
+    cxp, cyp = mx + px * off, my + py * off
+    pts = _bezier(sx, sy, cxp, cyp, ex, ey)
+    cv2.polylines(img, [pts], False, _sc(color, 0.22), 7, cv2.LINE_AA)
+    cv2.polylines(img, [pts], False, _sc(color, 0.50), 3, cv2.LINE_AA)
+    cv2.polylines(img, [pts], False, color,             1, cv2.LINE_AA)
+    return int(pts[-1][0][0]), int(pts[-1][0][1])
+
+
+# ── Pointed petal (tulip / lily shape, polygon fill) ──────────────────────
+
+def draw_petal(img, cx, cy, angle, length, width, color):
+    """Elongated pointed petal: narrow base → shoulder → sharp tip."""
+    ca, sa = math.cos(angle), math.sin(angle)
+    cp, sp = math.cos(angle + 1.5708), math.sin(angle + 1.5708)  # +π/2
+    hw = width * 0.5
+    sf = 0.35  # shoulder fraction along length
+    # shoulder centre
+    smx, smy = cx + ca * length * sf, cy + sa * length * sf
+    # tip
+    tx, ty = cx + ca * length, cy + sa * length
+    pts = np.array([
+        [int(cx),                int(cy)],
+        [int(smx + cp * hw),     int(smy + sp * hw)],
+        [int(tx),                int(ty)],
+        [int(smx - cp * hw),     int(smy - sp * hw)],
+    ], dtype=np.int32)
+    # glow pass (slightly larger)
+    g_hw = hw + 2
+    gpts = np.array([
+        [int(cx),                         int(cy)],
+        [int(smx + cp * g_hw),            int(smy + sp * g_hw)],
+        [int(cx + ca * (length + 3)),     int(cy + sa * (length + 3))],
+        [int(smx - cp * g_hw),            int(smy - sp * g_hw)],
+    ], dtype=np.int32)
+    cv2.fillPoly(img, [gpts], _sc(color, 0.28), cv2.LINE_AA)
+    cv2.fillPoly(img, [pts],  color,             cv2.LINE_AA)
+
+
+# ── Complete flower head ──────────────────────────────────────────────────
+
+def draw_flower(img, cx, cy, t, fi, sc=1.0):
+    """Render a flower head with pointed petals + white-hot glowing core."""
+    pal = COLORS[fi]
+    rot = t * 0.45 + fi * 1.25
+    pl, pw = PETAL_LEN * sc, PETAL_W * sc
+    if pl < 3:
         return
-
-    # Place the ellipse center halfway along the petal direction
-    ecx = int(cx + math.cos(angle) * half_len)
-    ecy = int(cy + math.sin(angle) * half_len)
-    angle_deg = math.degrees(angle)
-
-    cv2.ellipse(overlay, (ecx, ecy), (half_len, half_wid),
-                angle_deg, 0, 360, color, -1, cv2.LINE_AA)
-
-
-def draw_flower(overlay, cx, cy, t, finger_id, growth, alpha=1.0):
-    """
-    Render a complete multi-layered flower with pulsing glow.
-
-    Parameters
-    ----------
-    overlay : np.ndarray  — black overlay for additive blending
-    cx, cy  : int         — flower center pixel coordinates
-    t       : float       — global animation time (seconds)
-    finger_id : int       — 0-4 finger index (selects color palette)
-    growth  : float       — 0→1 bloom animation progress
-    alpha   : float       — overall opacity (for motion trail fade)
-    """
-    if growth < 0.02 or alpha < 0.02:
-        return
-
-    sp = FINGER_SPECIES[finger_id]
-    eg = ease_out_cubic(growth)         # Eased growth for smooth opening
-    combined = alpha * eg               # Overall visual intensity
-
-    # ── 1. God-Ray Halo (soft radial bloom behind the flower) ──────────
-    halo_r = int(48 * eg)
-    if halo_r > 2:
-        for frac in (1.0, 0.65, 0.35):
-            r = max(1, int(halo_r * frac))
-            intensity = combined * 0.20 * (1.0 - frac * 0.4)
-            cv2.circle(overlay, (cx, cy), r,
-                       scale_color(sp["glow"], intensity), -1, cv2.LINE_AA)
-
-    # ── 2. Layered Petals ─────────────────────────────────────────────
-    # Pulsing size modulation — breathing effect
-    pulse = 1.0 + 0.10 * math.sin(t * 2.8 + finger_id * 1.3)
-
-    for layer in range(PETAL_LAYERS):
-        layer_t = layer / max(1, PETAL_LAYERS - 1)   # 0 inner → 1 outer
-
-        petal_len = (10 + layer * 9) * eg * pulse
-        petal_wid = (5 + layer * 3) * eg * pulse
-
-        # Each ring rotates at a unique speed for visual richness
-        base_rot = t * (0.35 + layer * 0.1) + finger_id * (math.pi / 5)
-        # Sine-wave sway — gentle breeze oscillation
-        sway = math.sin(t * 1.6 + layer * 0.6 + finger_id * 0.9) * 0.18
-
-        petal_col = scale_color(
-            sp["petals"][layer % len(sp["petals"])],
-            combined * (1.0 - layer_t * 0.25),
-        )
-
-        n_petals = PETALS_PER_LAYER_BASE + layer    # More petals outward
-        for i in range(n_petals):
-            angle = base_rot + sway + (2 * math.pi * i / n_petals)
-            draw_petal(overlay, cx, cy, angle,
-                       petal_len, petal_wid, petal_col)
-
-    # ── 3. Luminous Center ────────────────────────────────────────────
-    cr = max(1, int(7 * eg * pulse))
-    cv2.circle(overlay, (cx, cy), cr,
-               scale_color(sp["center"], combined), -1, cv2.LINE_AA)
-    cv2.circle(overlay, (cx, cy), max(1, cr // 2),
-               scale_color(sp["center"], min(1.0, combined * 1.3)),
-               -1, cv2.LINE_AA)
+    for i in range(PETAL_N):
+        a = rot + 2 * math.pi * i / PETAL_N
+        c = pal["pet1"] if i % 2 == 0 else pal["pet2"]
+        draw_petal(img, cx, cy, a, pl, pw, c)
+    # Glowing centre: halo → core → white
+    cr = max(2, int(4 * sc))
+    cv2.circle(img, (cx, cy), cr * 3, _sc(pal["glow"], 0.30), -1, cv2.LINE_AA)
+    cv2.circle(img, (cx, cy), cr * 2, _sc(pal["core"], 0.65), -1, cv2.LINE_AA)
+    cv2.circle(img, (cx, cy), cr,     (255, 255, 255),         -1, cv2.LINE_AA)
 
 
-def draw_connections(overlay, landmarks, w, h, t):
-    """
-    Draw shimmering iridescent connection lines between palm landmarks
-    with a soft chromatic aberration glow effect.
-    """
-    for (i, j) in PALM_CONNECTIONS:
-        x1, y1 = int(landmarks[i].x * w), int(landmarks[i].y * h)
-        x2, y2 = int(landmarks[j].x * w), int(landmarks[j].y * h)
+# ── Palm crossing lines (blue / purple shimmer) ──────────────────────────
 
-        # Shimmer: oscillating brightness
-        shimmer = 0.45 + 0.35 * math.sin(t * 4.5 + i * 0.8)
-
-        # ── Chromatic aberration: offset R, G, B channels ──
-        off = 2  # pixel offset
-        cv2.line(overlay, (x1 - off, y1), (x2 - off, y2),
-                 (0, 0, int(160 * shimmer)), 1, cv2.LINE_AA)
-        cv2.line(overlay, (x1, y1), (x2, y2),
-                 (0, int(180 * shimmer), 0), 1, cv2.LINE_AA)
-        cv2.line(overlay, (x1 + off, y1), (x2 + off, y2),
-                 (int(160 * shimmer), 0, 0), 1, cv2.LINE_AA)
-
-        # ── Main iridescent line (hue cycles over time) ──
-        hue = int((t * 35 + i * 45) % 180)
-        iridescent_hsv = np.uint8([[[hue, 170, int(190 * shimmer)]]])
-        iridescent_bgr = cv2.cvtColor(iridescent_hsv, cv2.COLOR_HSV2BGR)[0][0]
-        cv2.line(overlay, (x1, y1), (x2, y2),
-                 tuple(int(c) for c in iridescent_bgr), 2, cv2.LINE_AA)
+def draw_palm_lines(img, pts, pairs, t):
+    """Thin iridescent lines crossing the palm between knuckle landmarks."""
+    for (a, b) in pairs:
+        if a >= len(pts) or b >= len(pts):
+            continue
+        p1 = (int(pts[a][0]), int(pts[a][1]))
+        p2 = (int(pts[b][0]), int(pts[b][1]))
+        sh = 0.40 + 0.40 * math.sin(t * 5.5 + a * 1.1)
+        hue = int((t * 28 + a * 35) % 180)
+        hsv = np.uint8([[[hue, 160, int(185 * sh)]]])
+        bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0][0]
+        col = (int(bgr[0]), int(bgr[1]), int(bgr[2]))
+        # 3-pass glow
+        cv2.line(img, p1, p2, _sc(col, 0.22), 5, cv2.LINE_AA)
+        cv2.line(img, p1, p2, _sc(col, 0.50), 2, cv2.LINE_AA)
+        cv2.line(img, p1, p2, col,             1, cv2.LINE_AA)
 
 
-def create_vignette(width, height):
-    """
-    Pre-compute a smooth radial vignette mask.
-    Returns a (H, W, 3) float32 array in [0, 1] range.
-    """
-    cx, cy = width / 2.0, height / 2.0
-    max_dist = math.hypot(cx, cy)
+# ── Lightweight hand skeleton (thin coloured lines on fingers) ────────────
 
-    Y, X = np.ogrid[:height, :width]
-    dist = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2).astype(np.float32)
+HAND_CONNS = [
+    # Thumb
+    (0,1),(1,2),(2,3),(3,4),
+    # Index
+    (0,5),(5,6),(6,7),(7,8),
+    # Middle
+    (0,9),(9,10),(10,11),(11,12),
+    # Ring
+    (0,13),(13,14),(14,15),(15,16),
+    # Pinky
+    (0,17),(17,18),(18,19),(19,20),
+    # Palm
+    (5,9),(9,13),(13,17),
+]
 
-    # Smooth power-curve falloff at the edges
-    mask = 1.0 - np.clip(dist / max_dist, 0, 1) ** 1.6 * 0.55
-    return np.stack([mask, mask, mask], axis=-1)   # Broadcast to 3 channels
+HAND_LINE_COL = (55, 180, 55)   # subtle green like the reference
+
+def draw_skeleton(img, pts):
+    """Thin hand skeleton overlay (visible in the reference video)."""
+    for (a, b) in HAND_CONNS:
+        p1 = (int(pts[a][0]), int(pts[a][1]))
+        p2 = (int(pts[b][0]), int(pts[b][1]))
+        cv2.line(img, p1, p2, HAND_LINE_COL, 1, cv2.LINE_AA)
+    # Small dots on landmarks
+    for i in range(21):
+        cv2.circle(img, (int(pts[i][0]), int(pts[i][1])), 2,
+                   (80, 220, 80), -1, cv2.LINE_AA)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  MAIN APPLICATION LOOP
+#  MODEL DOWNLOAD HELPER
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _find_model_path():
-    """
-    Locate the hand_landmarker.task model file.
-    Searches: script directory, cwd, then offers download instructions.
-    """
-    candidates = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task"),
-        os.path.join(os.getcwd(), "hand_landmarker.task"),
-    ]
-    for p in candidates:
+def _model():
+    for p in [os.path.join(os.path.dirname(os.path.abspath(__file__)),
+              "hand_landmarker.task"),
+              os.path.join(os.getcwd(), "hand_landmarker.task")]:
         if os.path.isfile(p):
             return p
-    # Auto-download if not found
-    dl_path = candidates[0]
-    print("📥  Downloading hand_landmarker.task model...")
+    dl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "hand_landmarker.task")
+    print("📥  Downloading hand_landmarker.task …")
     import urllib.request
-    url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
-    urllib.request.urlretrieve(url, dl_path)
-    print("✅  Model downloaded.")
-    return dl_path
+    urllib.request.urlretrieve(
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+        "hand_landmarker/float16/latest/hand_landmarker.task", dl)
+    print("✅  Done.")
+    return dl
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  MAIN LOOP
+# ═══════════════════════════════════════════════════════════════════════════
 
 def main():
-    """Entry point: initializes camera, MediaPipe, and runs the render loop."""
+    cam = CamThread().start()
+    if not cam.opened:
+        print("❌  Cannot open webcam."); return
 
-    # ── Webcam setup ──────────────────────────────────────────────────
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, 60)
+    first = cam.read()
+    if first is None:
+        print("❌  No frame."); cam.release(); return
+    H, W = first.shape[:2]
+    print(f"📷  {W}×{H}")
 
-    if not cap.isOpened():
-        print("❌  Error: Could not open webcam.")
-        return
-
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"📷  Camera opened at {actual_w}×{actual_h}")
-
-    # ── MediaPipe HandLandmarker (tasks API, v0.10+) ──────────────────
-    model_path = _find_model_path()
-    options = HandLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=model_path),
-        running_mode=VisionRunningMode.VIDEO,
+    lm_det = HandLandmarker.create_from_options(HandLandmarkerOpts(
+        base_options=BaseOptions(model_asset_path=_model()),
+        running_mode=RunMode.VIDEO,
         num_hands=MAX_HANDS,
-        min_hand_detection_confidence=0.60,
+        min_hand_detection_confidence=0.55,
         min_hand_presence_confidence=0.50,
-        min_tracking_confidence=0.50,
-    )
-    landmarker = HandLandmarker.create_from_options(options)
+        min_tracking_confidence=0.45,
+    ))
 
-    # ── Pre-computed assets ───────────────────────────────────────────
-    vignette = create_vignette(actual_w, actual_h)
+    # ── Pre-allocate (never allocate inside the loop) ─────────────────
+    overlay = np.zeros((H, W, 3), dtype=np.uint8)
 
-    # ── Per-hand, per-finger state ────────────────────────────────────
-    trails = [[FingertipTrail() for _ in range(5)] for _ in range(MAX_HANDS)]
-    particles = ParticleSystem()
+    smoothers = [Smoother() for _ in range(MAX_HANDS)]
+    blooms    = [[Bloom() for _ in range(5)] for _ in range(MAX_HANDS)]
+    palm_p    = [[] for _ in range(MAX_HANDS)]
+    p_shuf    = PALM_RESHUFFLE        # trigger on first frame
 
-    print("🌸  Flower Garden is blooming — press 'q' to quit")
+    print("🌺  Running — press 'q' to quit")
     t0 = time.time()
-    frame_count = 0
-    fps_text = ""
+    fn = 0; fps_t = ""
 
-    # ══════════════════════════════════════════════════════════════════
-    #  RENDER LOOP
     # ══════════════════════════════════════════════════════════════════
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+        raw = cam.read()
+        if raw is None: break
 
-        frame = cv2.flip(frame, 1)     # Mirror for natural interaction
-        t = time.time() - t0           # Animation clock (seconds)
+        frame = cv2.flip(raw, 1)
+        t = time.time() - t0
         h, w = frame.shape[:2]
 
-        # ── Run hand detection (tasks API) ────────────────────────────
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-        timestamp_ms = int(t * 1000)
-        results = landmarker.detect_for_video(mp_image, timestamp_ms)
+        # ── Detect ────────────────────────────────────────────────────
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        res = lm_det.detect_for_video(
+            mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb),
+            int(t * 1000))
 
-        # results.hand_landmarks is List[List[NormalizedLandmark]]
-        detected_hands = results.hand_landmarks  # may be empty list
+        hands  = res.hand_landmarks or []
+        hconf  = res.handedness or []
 
-        # ── Update fingertip trails ───────────────────────────────────
-        active_hands: set[int] = set()
+        # ── Dim background ────────────────────────────────────────────
+        dark = cv2.convertScaleAbs(frame, alpha=BG_ALPHA, beta=0)
 
-        if detected_hands:
-            for hi, hand_lm in enumerate(detected_hands):
-                if hi >= MAX_HANDS:
-                    break
-                active_hands.add(hi)
-                lm = hand_lm  # List[NormalizedLandmark] with .x, .y
+        # ── Clear overlay ─────────────────────────────────────────────
+        overlay[:] = 0
 
-                # Palm center (average of wrist, index-MCP, pinky-MCP)
-                pcx = int(sum(lm[k].x for k in (0, 5, 17)) / 3 * w)
-                pcy = int(sum(lm[k].y for k in (0, 5, 17)) / 3 * h)
+        # ── Reshuffle palm crossing pairs ─────────────────────────────
+        p_shuf += 1
+        if p_shuf >= PALM_RESHUFFLE:
+            p_shuf = 0
+            for hi in range(MAX_HANDS):
+                idx = list(range(len(KNUCKLE)))
+                rng.shuffle(idx)
+                palm_p[hi] = [(KNUCKLE[idx[i*2]], KNUCKLE[idx[i*2+1]])
+                              for i in range(min(PALM_LINES, len(idx)//2))]
 
-                for fi, tip_id in enumerate(FINGERTIP_IDS):
-                    fx = int(lm[tip_id].x * w)
-                    fy = int(lm[tip_id].y * h)
-                    trails[hi][fi].update(fx, fy, pcx, pcy)
+        active = set()
 
-        # Fade any hand that vanished
-        for hi in range(MAX_HANDS):
-            if hi not in active_hands:
-                for fi in range(5):
-                    trails[hi][fi].fade()
-
-        # ── Darken the camera background ──────────────────────────────
-        darkened = (frame.astype(np.float32) * BG_DARKEN).astype(np.uint8)
-
-        # ── Effects overlay (black canvas — additive blending later) ──
-        overlay = np.zeros_like(frame, dtype=np.uint8)
-
-        # ── A) Connection lines between palm landmarks ────────────────
-        if detected_hands:
-            for hi, hand_lm in enumerate(detected_hands):
-                if hi >= MAX_HANDS:
-                    break
-                draw_connections(overlay, hand_lm, w, h, t)
-
-        # ── B) Stems + Flowers + Particle spawning ────────────────────
-        for hi in range(MAX_HANDS):
-            for fi in range(5):
-                trail = trails[hi][fi]
-                if not trail.positions or trail.growth < 0.02:
+        for hi in range(min(len(hands), MAX_HANDS)):
+            # confidence gate
+            if hconf and hconf[hi]:
+                if hconf[hi][0].score < CONF_THRESH:
                     continue
+            active.add(hi)
 
-                dx, dy = trail.palm_dir        # Unit vector away from palm
+            pts = smoothers[hi](hands[hi], w, h)       # (21, 2)
 
-                # Render each position in the trail (newest → oldest)
-                for pi, (px, py) in enumerate(trail.positions):
-                    # Trail fade: older positions are dimmer
-                    age_frac = pi / TRAIL_LENGTH
-                    trail_alpha = (1.0 - age_frac) * trail.growth
-                    if trail_alpha < 0.04:
-                        continue
+            # Palm centre
+            pcx = (pts[0][0] + pts[5][0] + pts[17][0]) / 3
+            pcy = (pts[0][1] + pts[5][1] + pts[17][1]) / 3
 
-                    # Stem length shrinks for older trail entries
-                    stem_len = STEM_MAX_LEN * ease_out_cubic(trail.growth) \
-                               * (1.0 - age_frac * 0.5)
-                    tip_x = int(px + dx * stem_len)
-                    tip_y = int(py + dy * stem_len)
+            # ── Hand skeleton ─────────────────────────────────────────
+            draw_skeleton(overlay, pts)
 
-                    # Draw curved stem
-                    draw_stem(overlay, (px, py), (tip_x, tip_y),
-                              FINGER_SPECIES[fi]["stem"],
-                              thickness=max(1, int(2.5 * trail_alpha)),
-                              alpha=trail_alpha * 0.9)
+            # ── Palm crossing lines ───────────────────────────────────
+            if palm_p[hi]:
+                draw_palm_lines(overlay, pts, palm_p[hi], t)
 
-                    # Draw the flower at the stem tip
-                    flower_growth = trail.growth * (1.0 - age_frac * 0.7)
-                    draw_flower(overlay, tip_x, tip_y, t, fi,
-                                flower_growth, trail_alpha)
+            # ── Per-finger: fan of stems + flowers ────────────────────
+            for fi, tid in enumerate(FINGERTIP):
+                bl = blooms[hi][fi]
+                bl.tick()
+                fx, fy = pts[tid]
 
-                # Spawn particles from the newest (main) flower only
-                if trail.active and trail.growth > 0.3 and trail.positions:
-                    mx, my = trail.positions[0]
-                    s = STEM_MAX_LEN * ease_out_cubic(trail.growth)
-                    ptip_x = int(mx + dx * s)
-                    ptip_y = int(my + dy * s)
-                    particles.spawn(ptip_x, ptip_y,
-                                    FINGER_SPECIES[fi]["particle"],
-                                    count=PARTICLE_SPAWN_RATE)
+                # direction away from palm → base angle of fan
+                dx, dy = fx - pcx, fy - pcy
+                base_a = math.atan2(dy, dx)
+                gr = bl.g                           # 0→1 eased growth
 
-        # ── C) Update & draw particles ────────────────────────────────
-        particles.update(t)
-        particles.draw(overlay)
+                for si in range(bl.ns):
+                    a   = base_a + bl.ang[si]
+                    sln = bl.mlen[si] * gr
+                    if sln < 4: continue
+                    ex = fx + math.cos(a) * sln
+                    ey = fy + math.sin(a) * sln
 
-        # ── D) Create glow bloom (blurred copy of overlay) ────────────
-        glow = cv2.GaussianBlur(overlay, (0, 0),
-                                sigmaX=BLOOM_SIGMA, sigmaY=BLOOM_SIGMA)
+                    tip = draw_stem(overlay, fx, fy, ex, ey,
+                                    bl.curv[si], COLORS[fi]["stem"])
 
-        # ── E) Composite: dark BG + sharp overlay + soft bloom ────────
-        result = cv2.add(darkened, overlay)
-        result = cv2.add(result, glow)
+                    # flower only after 40 % growth
+                    if gr > 0.40:
+                        fsc = min(1.0, (gr - 0.40) / 0.60)
+                        draw_flower(overlay, tip[0], tip[1], t, fi, fsc)
 
-        # ── F) Apply vignette ─────────────────────────────────────────
-        result = (result.astype(np.float32) * vignette).astype(np.uint8)
+        # Reset inactive hands
+        for hi in range(MAX_HANDS):
+            if hi not in active:
+                smoothers[hi].reset()
+                for fi in range(5): blooms[hi][fi].reset()
 
-        # ── FPS overlay (updated every 20 frames for stability) ───────
-        frame_count += 1
-        if frame_count % 20 == 0:
-            elapsed = time.time() - t0
-            fps_val = frame_count / elapsed if elapsed > 0 else 0
-            fps_text = f"FPS: {fps_val:.0f}"
+        # ── Composite ─────────────────────────────────────────────────
+        result = cv2.addWeighted(dark, 1.0, overlay, 1.0, 0)
 
-        if fps_text:
-            cv2.putText(result, fps_text, (14, 32),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                        (90, 240, 90), 2, cv2.LINE_AA)
+        # ── FPS counter ───────────────────────────────────────────────
+        fn += 1
+        if fn % 25 == 0:
+            el = time.time() - t0
+            fps_t = f"FPS: {fn/el:.0f}" if el > 0 else ""
+        if fps_t:
+            cv2.putText(result, fps_t, (12, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                        (80, 230, 80), 2, cv2.LINE_AA)
 
-        # ── Show frame ────────────────────────────────────────────────
         cv2.imshow("Flower Garden", result)
-
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    # ── Cleanup ───────────────────────────────────────────────────────
-    cap.release()
+    cam.release()
     cv2.destroyAllWindows()
-    landmarker.close()
-    print("🌸  Flower Garden closed. Goodbye!")
+    lm_det.close()
+    print("🌺  Done.")
 
-
-# ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     main()
